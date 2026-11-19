@@ -1,0 +1,20 @@
+post_install() {
+    echo ">> wxscreensaver telepítve. A daemon a következő bejelentkezéskor automatikusan elindul."
+    echo ">> Az eredeti xscreensaver daemon ne fusson mellette (csak a hackjei kellenek). Ha az"
+    echo "   asztali környezeted automatikusan indítja, kapcsold ki az autostartját, illetve:"
+    echo "   systemctl --user mask xscreensaver.service"
+    echo ">> GNOME-on kívül (sway, Hyprland, KDE, ...) kell hozzá: pacman -S swayidle"
+    if [ -e /usr/local/bin/wxscreensaver ]; then
+        echo ">> FIGYELEM: a /usr/local/bin/wxscreensaver (install.sh-ból) előbbre van a PATH-ban,"
+        echo "   mint ez a csomag. Töröld: ./uninstall.sh --keep-config"
+    fi
+}
+
+post_upgrade() {
+    echo ">> wxscreensaver frissítve. A futó daemon újraindításához: wxscreensaver --quit,"
+    echo "   majd jelentkezz ki és be (vagy: wxscreensaver --daemon &)."
+}
+
+post_remove() {
+    echo ">> A felhasználói beállítások megmaradtak: ~/.config/wxscreensaver, ~/.cache/wxscreensaver"
+}

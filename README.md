@@ -17,12 +17,32 @@ Az xscreensaver Waylanden is működő pótlása. Az eredeti xscreensaver képer
 
 ## Telepítés (Arch Linux)
 
+### A) Csomagként (ajánlott)
+
+```bash
+git clone https://github.com/pbalee/wxscreensaver
+cd wxscreensaver
+makepkg -si
+```
+
+A `makepkg` megépíti a csomagot, az `-s` feltelepíti a függőségeket (`python-gobject`, `gtk3`,
+`xscreensaver`, `xorg-xwayland`), az `-i` pedig a `pacman`-nel telepíti. A daemon a következő
+bejelentkezéskor magától elindul (`/etc/xdg/autostart`). GNOME-on kívül kell hozzá a `swayidle` is
+(`sudo pacman -S swayidle`).
+
+Eltávolítás: `sudo pacman -Rns wxscreensaver` (a `~/.config/wxscreensaver` megmarad, kézzel törölhető).
+Frissítés: `git pull && makepkg -si`.
+
+### B) Telepítő szkripttel
+
 ```bash
 git clone https://github.com/pbalee/wxscreensaver
 cd wxscreensaver
 chmod +x install.sh wxscreensaver
 ./install.sh
 ```
+
+Ne használd egyszerre a kettőt. Ha az egyiket a másikra cseréled, előbb távolítsd el az előzőt.
 
 A telepítő sudo jelszót kér, majd:
 - `pacman`-nel feltelepíti a függőségeket: `python-gobject`, `gtk3`, `swayidle`, `xscreensaver`
@@ -34,7 +54,7 @@ A telepítő sudo jelszót kér, majd:
 
 Beállítások megnyitása: `wxscreensaver` (vagy a menüben a *wxscreensaver* bejegyzés).
 
-## Eltávolítás / frissítés
+## Eltávolítás / frissítés (telepítő szkript esetén)
 
 ```bash
 ./uninstall.sh                  # mindent töröl (program, indítók, beállítások, cache)

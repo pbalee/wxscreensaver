@@ -45,7 +45,7 @@ try:  # az elavult GLib/Gdk hívásokról szóló figyelmeztetések elnyomása
 except Exception:
     pass
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 BUS_NAME = "org.wxscreensaver.Daemon"
 CTL_PATH = "/org/wxscreensaver/Control"
 CTL_IFACE = "org.wxscreensaver.Control"
@@ -213,8 +213,18 @@ def self_exe():
     return shutil.which("wxscreensaver") or os.path.abspath(sys.argv[0])
 
 
+SYSTEM_AUTOSTART = "/etc/xdg/autostart/wxscreensaver.desktop"   # a csomag (PKGBUILD) telepíti
+
+
 def is_autostart():
-    return os.path.exists(AUTOSTART_FILE)
+    """A felhasználói fájl felülírja a rendszerszintűt (azonos fájlnév = azonos XDG autostart-bejegyzés)."""
+    if os.path.exists(AUTOSTART_FILE):
+        try:
+            with open(AUTOSTART_FILE, "r", encoding="utf-8") as f:
+                return not re.search(r"^Hidden\s*=\s*true\s*$", f.read(), re.I | re.M)
+        except OSError:
+            return True
+    return os.path.exists(SYSTEM_AUTOSTART)
 
 
 def set_autostart(on):
@@ -225,6 +235,12 @@ def set_autostart(on):
                     "Comment=Wayland screensaver daemon\n"
                     "Exec=%s --daemon\nNoDisplay=true\n"
                     "X-GNOME-Autostart-enabled=true\n" % self_exe())
+    elif os.path.exists(SYSTEM_AUTOSTART):
+        # rendszerszintű bejegyzést csak felülírni lehet: Hidden=true
+        os.makedirs(os.path.dirname(AUTOSTART_FILE), exist_ok=True)
+        with open(AUTOSTART_FILE, "w", encoding="utf-8") as f:
+            f.write("[Desktop Entry]\nType=Application\nName=wxscreensaver\n"
+                    "Exec=wxscreensaver --daemon\nHidden=true\n")
     else:
         try:
             os.remove(AUTOSTART_FILE)
