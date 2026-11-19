@@ -1,0 +1,1770 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+wxscreensaver - Wayland-kompatibilis xscreensaver-pótlás
+
+Az eredeti xscreensaver hackjeit (képernyőkímélőit) futtatja, de a saját
+daemonja és GUI-ja nem függ az X11 screensaver-kiterjesztéstől:
+
+  * tétlenség-érzékelés: swayidle (ext-idle-notify-v1) vagy GNOME/Mutter D-Bus
+  * képernyőkímélő ablak: teljes képernyős GTK3 ablak Xwaylanden (GDK_BACKEND=x11),
+    a hackek `-window-id`-vel ebbe rajzolnak
+  * org.freedesktop.ScreenSaver D-Bus szolgáltatás (videólejátszók inhibitjéhez)
+  * beállító GUI: a hackek XML-leírásaiból generált opciókkal és előnézettel
+
+Használat:
+  wxscreensaver --daemon      háttérszolgáltatás indítása
+  wxscreensaver [--settings]  beállító ablak
+  wxscreensaver --activate | --deactivate | --lock | --reload | --status | --quit
+"""
+import os
+import sys
+import re
+import json
+import glob
+import time
+import copy
+import random
+import shlex
+import signal
+import shutil
+import argparse
+import subprocess
+
+import xml.etree.ElementTree as ET
+
+# A hackek X11-es ablakba rajzolnak, ezért mindig Xwaylanden futunk.
+os.environ["GDK_BACKEND"] = "x11"
+
+import gi
+from gi.repository import GLib, Gio
+
+try:  # az elavult GLib/Gdk hívásokról szóló figyelmeztetések elnyomása
+    import warnings
+    warnings.simplefilter("ignore", gi.PyGIDeprecationWarning)
+except Exception:
+    pass
+
+VERSION = "0.1.0"
+BUS_NAME = "org.wxscreensaver.Daemon"
+CTL_PATH = "/org/wxscreensaver/Control"
+CTL_IFACE = "org.wxscreensaver.Control"
+FDO_NAME = "org.freedesktop.ScreenSaver"
+FDO_PATHS = ("/org/freedesktop/ScreenSaver", "/ScreenSaver")
+DEBUG = bool(os.environ.get("WXSS_DEBUG"))
+
+HACK_DIRS = [
+    "/usr/lib/xscreensaver",
+    "/usr/libexec/xscreensaver",
+    "/usr/lib64/xscreensaver",
+    "/usr/local/libexec/xscreensaver",
+    "/usr/local/lib/xscreensaver",
+]
+CONFIG_XML_DIRS = [
+    "/usr/share/xscreensaver/config",
+    "/usr/local/share/xscreensaver/config",
+    "/etc/xscreensaver/config",
+]
+
+CONFIG_DIR = os.path.join(GLib.get_user_config_dir(), "wxscreensaver")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+AUTOSTART_FILE = os.path.join(GLib.get_user_config_dir(), "autostart", "wxscreensaver.desktop")
+
+DEFAULTS = {
+    "mode": "random",          # off | blank | random | one
+    "timeout": 10,             # perc tétlenség után indul
+    "cycle": 10,               # percenként vált másik hackre
+    "selected": "",            # "one" módban ez fut
+    "disabled": [],            # véletlen módból kizárt hackek
+    "options": {},             # hack -> {control id: érték}
+    "lock": False,
+    "lock_after": 0,           # perc a képernyőkímélő indulása után (0 = azonnal)
+    "lock_command": "loginctl lock-session",
+    "backend": "auto",         # auto | swayidle | mutter
+    "gl_driver": "auto",       # auto | native | zink | mesa
+}
+
+
+def log(*a):
+    print("[wxscreensaver]", *a, file=sys.stderr, flush=True)
+
+
+def unix_signal_add(sig, cb):
+    """Unix-jelzés figyelése (GLibUnix, ha van; régebbi GLib-en a GLib.unix_signal_add)."""
+    try:
+        from gi.repository import GLibUnix
+        return GLibUnix.signal_add(GLib.PRIORITY_DEFAULT, int(sig), cb)
+    except Exception:
+        return GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, int(sig), cb)
+
+
+_CSS = {"done": False}
+
+
+def install_css():
+    """Fekete háttér (.wxss-black) – a képernyőkímélő ablakhoz és az előnézethez."""
+    if _CSS["done"]:
+        return
+    css = Gtk.CssProvider()
+    css.load_from_data(b".wxss-black { background-color: #000000; background-image: none; }")
+    Gtk.StyleContext.add_provider_for_screen(
+        Gdk.Display.get_default().get_default_screen(), css,
+        Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+    _CSS["done"] = True
+
+
+# --------------------------------------------------------------------------
+# Fordítás (angol -> magyar, LANG alapján)
+# --------------------------------------------------------------------------
+HU = {
+    "Screensavers": "Képernyőkímélők",
+    "Settings": "Beállítások",
+    "Test": "Teszt",
+    "Mode:": "Mód:",
+    "Disabled": "Kikapcsolva",
+    "Blank screen only": "Csak üres képernyő",
+    "Random screensaver": "Véletlenszerű képernyőkímélő",
+    "Only one screensaver": "Csak a kijelölt képernyőkímélő",
+    "Search…": "Keresés…",
+    "Reset to defaults": "Alapértékek",
+    "Options": "Opciók",
+    "No description.": "Nincs leírás.",
+    "Preview could not be started.": "Az előnézet nem indult el.",
+    "Start after (minutes of inactivity)": "Indítás ennyi perc tétlenség után",
+    "Switch screensaver every (minutes)": "Váltás ennyi percenként",
+    "Lock the screen": "Képernyő zárolása",
+    "Lock after (minutes, 0 = immediately)": "Zárolás ennyi perc után (0 = azonnal)",
+    "Lock command": "Zároló parancs",
+    "Start at login": "Indítás bejelentkezéskor",
+    "Idle detection": "Tétlenség-érzékelés",
+    "Automatic": "Automatikus",
+    "OpenGL driver": "OpenGL driver",
+    "System driver (e.g. NVIDIA)": "Rendszer-driver (pl. NVIDIA)",
+    "Mesa Zink (GPU through Vulkan)": "Mesa Zink (GPU Vulkanon át)",
+    "Mesa software rendering": "Mesa szoftveres renderelés",
+    "Daemon": "Háttérszolgáltatás",
+    "running": "fut",
+    "not running": "nem fut",
+    "Restart daemon": "Szolgáltatás újraindítása",
+    "Select the screensaver from the list.": "Válaszd ki a használni kívánt képernyőkímélőt a listából.",
+    "Check all": "Mind be",
+    "Uncheck all": "Mind ki",
+    "Locking note": ("A tényleges zárolást a compositor zárolója végzi (pl. swaylock, hyprlock, "
+                     "gtklock vagy loginctl lock-session). Egy X11 ablak Waylanden nem tud "
+                     "biztonságosan zárolni."),
+}
+_LANG = (os.environ.get("LC_ALL") or os.environ.get("LC_MESSAGES") or os.environ.get("LANG") or "").lower()
+_HU = _LANG.startswith("hu")
+
+
+def tr(s):
+    return HU.get(s, s) if _HU else s
+
+
+# --------------------------------------------------------------------------
+# Konfiguráció
+# --------------------------------------------------------------------------
+def load_config():
+    cfg = copy.deepcopy(DEFAULTS)
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            cfg.update(data)
+    except (OSError, ValueError):
+        pass
+    return cfg
+
+
+def save_config(cfg):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    tmp = CONFIG_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, CONFIG_FILE)
+
+
+def self_exe():
+    return shutil.which("wxscreensaver") or os.path.abspath(sys.argv[0])
+
+
+def is_autostart():
+    return os.path.exists(AUTOSTART_FILE)
+
+
+def set_autostart(on):
+    if on:
+        os.makedirs(os.path.dirname(AUTOSTART_FILE), exist_ok=True)
+        with open(AUTOSTART_FILE, "w", encoding="utf-8") as f:
+            f.write("[Desktop Entry]\nType=Application\nName=wxscreensaver\n"
+                    "Comment=Wayland screensaver daemon\n"
+                    "Exec=%s --daemon\nNoDisplay=true\n"
+                    "X-GNOME-Autostart-enabled=true\n" % self_exe())
+    else:
+        try:
+            os.remove(AUTOSTART_FILE)
+        except OSError:
+            pass
+
+
+# --------------------------------------------------------------------------
+# X display (Xwayland) előkészítése
+# --------------------------------------------------------------------------
+def ensure_display():
+    if os.environ.get("DISPLAY"):
+        return True
+    try:
+        out = subprocess.run(["systemctl", "--user", "show-environment"],
+                             capture_output=True, text=True, timeout=3).stdout
+        for line in out.splitlines():
+            if line.startswith("DISPLAY=") or line.startswith("XAUTHORITY="):
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k, v)
+    except Exception:
+        pass
+    if not os.environ.get("DISPLAY") and os.path.exists("/tmp/.X11-unix/X0"):
+        os.environ["DISPLAY"] = ":0"
+    return bool(os.environ.get("DISPLAY"))
+
+
+Gtk = Gdk = GdkX11 = None
+
+
+def ensure_gtk():
+    """A GTK-t csak akkor töltjük be, amikor tényleg kell (a daemon enélkül is elindul)."""
+    global Gtk, Gdk, GdkX11
+    if Gtk is not None:
+        return Gdk.Display.get_default() is not None
+    if not ensure_display():
+        log("Nincs DISPLAY – fut az Xwayland?")
+        return False
+    try:
+        gi.require_version("Gtk", "3.0")
+        gi.require_version("Gdk", "3.0")
+        gi.require_version("GdkX11", "3.0")
+        from gi.repository import Gtk as _Gtk, Gdk as _Gdk, GdkX11 as _GdkX11
+    except Exception as e:
+        log("GTK3 betöltése nem sikerült:", e)
+        return False
+    Gtk, Gdk, GdkX11 = _Gtk, _Gdk, _GdkX11
+    if Gdk.Display.get_default() is None:
+        log("Nem sikerült csatlakozni az X szerverhez (Xwayland).")
+        return False
+    return True
+
+
+# --------------------------------------------------------------------------
+# xscreensaver hackek felderítése (XML-leírások)
+# --------------------------------------------------------------------------
+class Hack:
+    def __init__(self, name, label, desc, binary, base_args, controls):
+        self.name = name
+        self.label = label
+        self.desc = desc
+        self.binary = binary
+        self.base_args = base_args
+        self.controls = controls
+
+    def argv(self, values, xid):
+        args = []
+        for c in self.controls:
+            args += control_args(c, values.get(c["id"], c["default"]))
+        base = [a for a in self.base_args if a != "-root"]
+        return [self.binary] + base + args + ["-window-id", hex(xid)]
+
+
+def control_args(c, v):
+    t = c["type"]
+    if t == "bool":
+        if v and c["set"]:
+            return shlex.split(c["set"])
+        if (not v) and c["unset"]:
+            return shlex.split(c["unset"])
+    elif t == "select":
+        for o in c["options"]:
+            if o["id"] == v and o["arg"]:
+                return shlex.split(o["arg"])
+    elif t == "number":
+        try:
+            x = float(v)
+        except (TypeError, ValueError):
+            return []
+        if abs(x - c["default"]) < 1e-9 or not c["arg"]:
+            return []
+        s = str(int(round(x))) if c["int"] else ("%g" % x)
+        return [tok.replace("%", s) for tok in shlex.split(c["arg"])]
+    elif t == "string":
+        if v and c["arg"]:
+            return [tok.replace("%", str(v)) for tok in shlex.split(c["arg"])]
+    return []
+
+
+def _clean_text(text):
+    paras = re.split(r"\n\s*\n", (text or "").strip())
+    return "\n\n".join(" ".join(p.split()) for p in paras if p.strip())
+
+
+def parse_hack(path):
+    try:
+        root = ET.parse(path).getroot()
+    except Exception:
+        return None
+    if root.tag != "screensaver":
+        return None
+    name = root.get("name")
+    if not name:
+        return None
+    binary = None
+    for d in HACK_DIRS:
+        p = os.path.join(d, name)
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            binary = p
+            break
+    if not binary:
+        binary = shutil.which(name)
+    if not binary:
+        return None
+
+    base = []
+    for cmd in root.findall("command"):
+        a = cmd.get("arg")
+        if a:
+            try:
+                base += shlex.split(a)
+            except ValueError:
+                pass
+
+    desc_el = root.find("_description")
+    desc = _clean_text("".join(desc_el.itertext())) if desc_el is not None else ""
+
+    controls = []
+    idx = 0
+    for el in root.iter():
+        t = el.tag
+        if t not in ("number", "boolean", "select", "string"):
+            continue
+        idx += 1
+        cid = el.get("id") or "c%d" % idx
+        label = el.get("_label") or ""
+        try:
+            if t == "number":
+                arg = el.get("arg") or ""
+                if not arg:
+                    continue
+                low = float(el.get("low", "0"))
+                high = float(el.get("high", "100"))
+                default = float(el.get("default", el.get("low", "0")))
+                isint = all("." not in (el.get(k) or "") for k in ("low", "high", "default"))
+                controls.append(dict(
+                    type="number", id=cid, label=label or cid, arg=arg,
+                    low=low, high=high, default=default, int=isint,
+                    invert=(el.get("convert") == "invert"),
+                    low_label=el.get("_low-label") or "",
+                    high_label=el.get("_high-label") or "",
+                    widget=el.get("type") or "slider"))
+            elif t == "boolean":
+                aset = el.get("arg-set") or ""
+                aunset = el.get("arg-unset") or ""
+                if not aset and not aunset:
+                    continue
+                default = False if (aset and not aunset) else True
+                controls.append(dict(type="bool", id=cid, label=label or cid,
+                                     set=aset, unset=aunset, default=default))
+            elif t == "select":
+                opts = []
+                for i, o in enumerate(el.findall("option")):
+                    opts.append(dict(id=o.get("id") or "o%d" % i,
+                                     label=o.get("_label") or o.get("id") or "?",
+                                     arg=o.get("arg-set") or ""))
+                if len(opts) < 2:
+                    continue
+                default = next((o["id"] for o in opts if not o["arg"]), opts[0]["id"])
+                controls.append(dict(type="select", id=cid, label=label,
+                                     options=opts, default=default))
+            elif t == "string":
+                arg = el.get("arg") or el.get("arg-set") or ""
+                if not arg:
+                    continue
+                controls.append(dict(type="string", id=cid, label=label or cid,
+                                     arg=arg, default=""))
+        except ValueError:
+            continue
+    return Hack(name, root.get("_label") or name, desc, binary, base, controls)
+
+
+def load_hacks():
+    hacks = {}
+    for d in CONFIG_XML_DIRS:
+        for f in sorted(glob.glob(os.path.join(d, "*.xml"))):
+            h = parse_hack(f)
+            if h and h.name not in hacks:
+                hacks[h.name] = h
+    ordered = sorted(hacks.values(), key=lambda h: h.label.lower())
+    return {h.name: h for h in ordered}
+
+
+# --------------------------------------------------------------------------
+# Hack-folyamat kezelés
+# --------------------------------------------------------------------------
+def hack_log_path(name):
+    """A hackek hibakimenete: ~/.cache/wxscreensaver/<hack>.log (az utolsó futás)."""
+    d = os.path.join(GLib.get_user_cache_dir(), "wxscreensaver")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        return "/dev/null"
+    return os.path.join(d, name + ".log")
+
+
+_GLVIS = {}
+
+
+def gl_visual_id():
+    """A legjobb GLX visual azonosítója – ugyanaz, amit az xscreensaver daemon használ.
+
+    A GL hackek csak olyan ablakba tudnak rajzolni, aminek a visualja GLX-képes
+    (mélységi puffer, dupla pufferelés); az alapértelmezett visual gyakran nem az.
+    """
+    if "id" in _GLVIS:
+        return _GLVIS["id"]
+    vid = None
+    for name, args in (("xscreensaver-gl-visual", []), ("xscreensaver-gl-helper", []),
+                       ("glxinfo", ["-b"])):
+        exe = None
+        for d in HACK_DIRS:
+            p = os.path.join(d, name)
+            if os.path.isfile(p) and os.access(p, os.X_OK):
+                exe = p
+                break
+        exe = exe or shutil.which(name)
+        if not exe:
+            continue
+        try:
+            out = subprocess.run([exe] + args, capture_output=True, text=True,
+                                 timeout=10).stdout
+        except Exception:
+            continue
+        m = re.search(r"\b(0x[0-9a-fA-F]+|\d+)\b", out)
+        if m:
+            vid = int(m.group(1), 0)
+            break
+    if vid is None:
+        log("Nem találtam GL visualt (xscreensaver-gl-helper / glxinfo) – a GL hackek feketék lehetnek.")
+    else:
+        log("GL visual: 0x%x" % vid)
+    _GLVIS["id"] = vid
+    return vid
+
+
+def apply_gl_visual(win):
+    """GL-képes visual beállítása egy (még nem realizált) ablakra."""
+    vid = gl_visual_id()
+    if not vid:
+        return
+    try:
+        vis = GdkX11.X11Screen.lookup_visual(win.get_screen(), vid)
+        if vis is not None:
+            win.set_visual(vis)
+        else:
+            log("A GDK nem ismeri a 0x%x visualt" % vid)
+    except Exception as e:
+        log("GL visual beállítása sikertelen:", e)
+
+
+# --- GL driver tartalék -----------------------------------------------------
+# Az új xscreensaver a GL hackekhez EGL-t használ. Néhány rendszeren (pl. NVIDIA
+# + Xwayland) az eglCreatePlatformWindowSurface hibával leáll; a Mesa EGL-je viszont
+# működik. "auto" módban ha egy hack EGL/GLX hibával azonnal kilép, lépcsőzetesen
+# átváltunk: native -> zink (Mesa a GPU Vulkan-ján) -> mesa (szoftveres llvmpipe).
+GL_LEVELS = ("native", "zink", "mesa")
+_GLSTATE = {"level": None}
+
+
+def _gl_state_path():
+    return os.path.join(GLib.get_user_cache_dir(), "wxscreensaver", "gl_level")
+
+
+def gl_auto_level(reload=False):
+    if _GLSTATE["level"] is None or reload:
+        lvl = "native"
+        try:
+            with open(_gl_state_path(), "r") as f:
+                v = f.read().strip()
+            if v in GL_LEVELS:
+                lvl = v
+        except OSError:
+            pass
+        _GLSTATE["level"] = lvl
+    return _GLSTATE["level"]
+
+
+def gl_set_auto_level(level):
+    _GLSTATE["level"] = level
+    try:
+        os.makedirs(os.path.dirname(_gl_state_path()), exist_ok=True)
+        with open(_gl_state_path(), "w") as f:
+            f.write(level)
+    except OSError:
+        pass
+
+
+def gl_level(cfg):
+    g = cfg.get("gl_driver", "auto")
+    if g == "auto":
+        return gl_auto_level()
+    return g if g in GL_LEVELS else "native"
+
+
+def gl_env(level):
+    """Környezeti változók a hackeknek az adott GL-szinthez."""
+    if level == "native":
+        return {}
+    env = {"__GLX_VENDOR_LIBRARY_NAME": "mesa"}
+    for p in sorted(glob.glob("/usr/share/glvnd/egl_vendor.d/*mesa*.json")):
+        env["__EGL_VENDOR_LIBRARY_FILENAMES"] = p
+        break
+    if level == "zink":
+        env["MESA_LOADER_DRIVER_OVERRIDE"] = "zink"
+    else:
+        env["LIBGL_ALWAYS_SOFTWARE"] = "1"
+        env["GALLIUM_DRIVER"] = "llvmpipe"
+    return env
+
+
+def gl_failed(name):
+    """A hack hibanaplója EGL/GLX/OpenGL hibára utal?"""
+    try:
+        with open(hack_log_path(name), "r", errors="replace") as f:
+            text = f.read(20000)
+    except OSError:
+        return False
+    return re.search(r"egl|glx|opengl", text, re.I) is not None
+
+
+def gl_escalate(cfg, seen_level):
+    """Egy szinttel feljebb lép (csak "auto" módban). Az új szintet adja vissza, vagy None-t."""
+    if cfg.get("gl_driver", "auto") != "auto":
+        return None
+    cur = gl_auto_level()
+    if cur != seen_level:          # közben másik monitor/előnézet már váltott
+        return cur
+    i = GL_LEVELS.index(cur)
+    if i + 1 >= len(GL_LEVELS):
+        return None
+    nxt = GL_LEVELS[i + 1]
+    gl_set_auto_level(nxt)
+    log("GL hiba a '%s' szinten – átváltok erre: %s" % (cur, nxt))
+    return nxt
+
+
+class HackProc:
+    def __init__(self, on_exit=None):
+        self.proc = None
+        self.gen = 0
+        self.on_exit = on_exit
+
+    def start(self, argv, env=None):
+        self.stop()
+        launcher = Gio.SubprocessLauncher.new(Gio.SubprocessFlags.NONE)
+        if not DEBUG:
+            launcher.set_stdout_file_path("/dev/null")
+            launcher.set_stderr_file_path(hack_log_path(os.path.basename(argv[0])))
+        path = os.environ.get("PATH", "/usr/bin")
+        for d in HACK_DIRS:
+            if os.path.isdir(d):
+                path = d + ":" + path
+        launcher.setenv("PATH", path, True)
+        for k, v in (env or {}).items():
+            launcher.setenv(k, v, True)
+        try:
+            p = launcher.spawnv(argv)
+        except GLib.Error as e:
+            log("Hack indítása sikertelen:", argv[0], e.message)
+            return False
+        self.proc = p
+        self.gen += 1
+        gen, t0 = self.gen, time.monotonic()
+        p.wait_async(None, lambda pr, res: self._done(pr, res, gen, t0))
+        return True
+
+    def _done(self, pr, res, gen, t0):
+        try:
+            pr.wait_finish(res)
+        except GLib.Error:
+            pass
+        if gen != self.gen:
+            return
+        self.proc = None
+        if self.on_exit:
+            self.on_exit(time.monotonic() - t0)
+
+    def stop(self):
+        p, self.proc = self.proc, None
+        self.gen += 1
+        if p is None:
+            return
+        try:
+            p.send_signal(signal.SIGTERM)
+        except Exception:
+            return
+
+        def kill():
+            try:
+                p.force_exit()
+            except Exception:
+                pass
+            return False
+        GLib.timeout_add(1500, kill)
+
+
+# --------------------------------------------------------------------------
+# Tétlenség-érzékelő backendek
+# --------------------------------------------------------------------------
+def _pdeathsig():
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").prctl(1, int(signal.SIGTERM))  # PR_SET_PDEATHSIG
+    except Exception:
+        pass
+
+
+def _sig_handler(cb):
+    def f(*a):
+        cb()
+        return True
+    return f
+
+
+class SwayidleBackend:
+    """swayidle (ext-idle-notify-v1): wlroots-alapú compositorok, KDE, stb."""
+    name = "swayidle"
+
+    @staticmethod
+    def available():
+        return shutil.which("swayidle") is not None
+
+    def __init__(self):
+        self.main = None
+        self.helper = None
+        self.srcs = []
+
+    def start(self, timeout_s, on_idle, on_resume):
+        pid = os.getpid()
+        self.srcs = [
+            unix_signal_add(signal.SIGUSR1, _sig_handler(on_idle)),
+            unix_signal_add(signal.SIGUSR2, _sig_handler(on_resume)),
+        ]
+        self.main = subprocess.Popen(
+            ["swayidle", "-w",
+             "timeout", str(int(timeout_s)), "kill -USR1 %d" % pid,
+             "resume", "kill -USR2 %d" % pid],
+            preexec_fn=_pdeathsig)
+
+    def watch_resume(self):
+        """Kézi aktiválásnál: 1 mp tétlenség után az első mozdulatra jelez."""
+        self.cancel_resume()
+        self.helper = subprocess.Popen(
+            ["swayidle", "-w", "timeout", "1", "true",
+             "resume", "kill -USR2 %d" % os.getpid()],
+            preexec_fn=_pdeathsig)
+
+    def cancel_resume(self):
+        self._kill(self.helper)
+        self.helper = None
+
+    @staticmethod
+    def _kill(p):
+        if p is None:
+            return
+        try:
+            p.terminate()
+            try:
+                p.wait(0.4)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                p.wait()
+        except Exception:
+            pass
+
+    def stop(self):
+        self.cancel_resume()
+        self._kill(self.main)
+        self.main = None
+        for s in self.srcs:
+            GLib.source_remove(s)
+        self.srcs = []
+
+
+class MutterBackend:
+    """GNOME/Mutter IdleMonitor D-Bus API."""
+    name = "mutter"
+    BUS = "org.gnome.Mutter.IdleMonitor"
+    PATH = "/org/gnome/Mutter/IdleMonitor/Core"
+
+    @staticmethod
+    def available():
+        return "GNOME" in os.environ.get("XDG_CURRENT_DESKTOP", "").upper()
+
+    def __init__(self):
+        self.conn = None
+        self.sub = None
+        self.idle_id = None
+        self.active_id = None
+        self.on_idle = self.on_resume = None
+
+    def _call(self, method, args, rtype):
+        return self.conn.call_sync(self.BUS, self.PATH, self.BUS, method, args,
+                                   GLib.VariantType(rtype) if rtype else None,
+                                   Gio.DBusCallFlags.NONE, 2000, None)
+
+    def start(self, timeout_s, on_idle, on_resume):
+        self.on_idle, self.on_resume = on_idle, on_resume
+        self.conn = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        self.sub = self.conn.signal_subscribe(self.BUS, self.BUS, "WatchFired", self.PATH,
+                                              None, Gio.DBusSignalFlags.NONE, self._fired)
+        self.idle_id = self._call("AddIdleWatch",
+                                  GLib.Variant("(t)", (int(timeout_s * 1000),)), "(u)").unpack()[0]
+
+    def _fired(self, *a):
+        wid = a[5].unpack()[0]
+        if wid == self.idle_id:
+            self.on_idle()
+        elif wid == self.active_id:
+            self.active_id = None
+            self.on_resume()
+
+    def watch_resume(self):
+        if self.active_id is not None:
+            return
+        try:
+            self.active_id = self._call("AddUserActiveWatch", None, "(u)").unpack()[0]
+        except GLib.Error as e:
+            log("AddUserActiveWatch:", e.message)
+
+    def cancel_resume(self):
+        if self.active_id is not None:
+            try:
+                self._call("RemoveWatch", GLib.Variant("(u)", (self.active_id,)), None)
+            except GLib.Error:
+                pass
+            self.active_id = None
+
+    def stop(self):
+        self.cancel_resume()
+        try:
+            if self.idle_id is not None:
+                self._call("RemoveWatch", GLib.Variant("(u)", (self.idle_id,)), None)
+        except GLib.Error:
+            pass
+        if self.sub is not None:
+            self.conn.signal_unsubscribe(self.sub)
+        self.sub = self.idle_id = None
+
+
+# --------------------------------------------------------------------------
+# Teljes képernyős képernyőkímélő ablakok
+# --------------------------------------------------------------------------
+class Head:
+    """Egy monitor: fekete ablak + a benne futó hack."""
+
+    def __init__(self, saver, index):
+        self.saver = saver
+        self.index = index
+        self.proc = HackProc(self._on_exit)
+        self.cur = None
+        self.running = False
+        self.fails = 0
+        self.p0 = None
+        self.level = "native"
+
+        display = Gdk.Display.get_default()
+        monitor = display.get_monitor(index)
+        geo = monitor.get_geometry()
+
+        win = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
+        win.set_title("wxscreensaver")
+        win.set_decorated(False)
+        win.set_keep_above(True)
+        win.set_skip_taskbar_hint(True)
+        win.set_skip_pager_hint(True)
+        win.set_app_paintable(True)
+        win.set_can_focus(True)
+        win.get_style_context().add_class("wxss-black")
+        apply_gl_visual(win)
+        win.set_default_size(geo.width, geo.height)
+        win.move(geo.x, geo.y)
+        win.add_events(Gdk.EventMask.KEY_PRESS_MASK | Gdk.EventMask.BUTTON_PRESS_MASK |
+                       Gdk.EventMask.POINTER_MOTION_MASK | Gdk.EventMask.SCROLL_MASK)
+        for sig in ("key-press-event", "button-press-event", "motion-notify-event", "scroll-event"):
+            win.connect(sig, self._on_event)
+
+        area = Gtk.DrawingArea()
+        area.connect("draw", self._draw)
+        area.connect("realize", self._realize)
+        area.connect("map", lambda *_: GLib.timeout_add(600, self._first_launch))
+        win.add(area)
+        self.window, self.area = win, area
+
+        win.show_all()
+        try:
+            win.fullscreen_on_monitor(display.get_default_screen(), index)
+        except Exception:
+            win.fullscreen()
+        win.present()
+
+    # -- rajzolás / ablak
+    def _realize(self, area):
+        gw = area.get_window()
+        try:
+            gw.ensure_native()
+            gw.set_background_rgba(Gdk.RGBA(0, 0, 0, 1))
+        except Exception:
+            pass
+        blank = Gdk.Cursor.new_for_display(Gdk.Display.get_default(), Gdk.CursorType.BLANK_CURSOR)
+        gw.set_cursor(blank)
+        top = self.window.get_window()
+        if top:
+            top.set_cursor(blank)
+
+    def _draw(self, w, cr):
+        if not self.running:
+            cr.set_source_rgb(0, 0, 0)
+            cr.paint()
+        return True
+
+    def xid(self):
+        gw = self.area.get_window()
+        return GdkX11.X11Window.get_xid(gw) if gw else 0
+
+    # -- bemenet -> kilépés
+    def _on_event(self, w, ev):
+        if time.monotonic() - self.saver.t0 < 1.0:
+            return False
+        if ev.type == Gdk.EventType.MOTION_NOTIFY:
+            if self.p0 is None:
+                self.p0 = (ev.x_root, ev.y_root)
+                return False
+            if abs(ev.x_root - self.p0[0]) + abs(ev.y_root - self.p0[1]) < 10:
+                return False
+        GLib.idle_add(self.saver.daemon.deactivate)
+        return True
+
+    # -- hack indítása
+    def _first_launch(self):
+        if self.saver.active:
+            self.launch()
+        return False
+
+    def launch(self, hack="auto"):
+        if hack == "auto":
+            hack = self.saver.pick(self.cur)
+        self.cur = hack
+        self.proc.stop()
+        self.running = False
+        if hack is None:
+            self.area.queue_draw()
+            return
+        xid = self.xid()
+        if not xid:
+            self.area.queue_draw()
+            return
+        cfg = self.saver.daemon.cfg
+        opts = cfg["options"].get(hack.name, {})
+        self.level = gl_level(cfg)
+        self.running = self.proc.start(hack.argv(opts, xid), gl_env(self.level))
+        if not self.running:
+            self._on_exit(0)
+        self.area.queue_draw()
+
+    def switch(self):
+        self.proc.stop()
+        self.running = False
+        self.area.queue_draw()
+        GLib.timeout_add(300, self._relaunch)
+
+    def _relaunch(self):
+        if self.saver.active:
+            self.launch()
+        return False
+
+    def _relaunch_same(self):
+        if self.saver.active and self.cur is not None:
+            self.launch(self.cur)
+        return False
+
+    def _on_exit(self, runtime):
+        self.running = False
+        if runtime < 3 and self.cur is not None:
+            log("%s gyorsan kilépett, hibanapló: %s" % (
+                self.cur.name, hack_log_path(self.cur.name)))
+            if gl_failed(self.cur.name) and gl_escalate(self.saver.daemon.cfg, self.level):
+                self.fails = 0
+                self.area.queue_draw()
+                GLib.timeout_add(200, self._relaunch_same)
+                return
+        self.fails = self.fails + 1 if runtime < 3 else 0
+        if self.fails >= 5:
+            log("A hack(ek) folyton kilépnek, üres képernyő marad.")
+            self.cur = None
+            self.area.queue_draw()
+            return
+        self.area.queue_draw()
+        GLib.timeout_add(300, self._relaunch)
+
+    def close(self):
+        self.proc.stop()
+        self.window.destroy()
+
+
+class Saver:
+    def __init__(self, daemon):
+        self.daemon = daemon
+        self.heads = []
+        self.active = False
+        self.t0 = time.monotonic()
+        self.cycle_src = None
+
+    def start(self):
+        if not ensure_gtk():
+            return False
+        install_css()
+        display = Gdk.Display.get_default()
+        for i in range(max(1, display.get_n_monitors())):
+            self.heads.append(Head(self, i))
+        self.active = True
+        cyc = int(self.daemon.cfg["cycle"]) * 60
+        if cyc > 0 and self.daemon.cfg["mode"] in ("random", "off"):
+            self.cycle_src = GLib.timeout_add_seconds(cyc, self._cycle)
+        return True
+
+    def _cycle(self):
+        for h in self.heads:
+            h.switch()
+        return True
+
+    def pick(self, avoid=None):
+        cfg = self.daemon.cfg
+        hacks = self.daemon.hacks()
+        mode = cfg["mode"]
+        if mode == "blank" or not hacks:
+            return None
+        if mode == "one" and cfg["selected"] in hacks:
+            return hacks[cfg["selected"]]
+        pool = [h for n, h in hacks.items() if n not in cfg["disabled"]]
+        if avoid is not None and len(pool) > 1:
+            pool = [h for h in pool if h is not avoid]
+        return random.choice(pool) if pool else None
+
+    def stop(self):
+        self.active = False
+        if self.cycle_src:
+            GLib.source_remove(self.cycle_src)
+            self.cycle_src = None
+        for h in self.heads:
+            h.close()
+        self.heads = []
+
+
+# --------------------------------------------------------------------------
+# Daemon
+# --------------------------------------------------------------------------
+CTL_XML = """<node><interface name="org.wxscreensaver.Control">
+<method name="Activate"/><method name="Deactivate"/><method name="Lock"/>
+<method name="Reload"/><method name="Quit"/>
+<method name="Status"><arg type="s" direction="out"/></method>
+</interface></node>"""
+
+FDO_XML = """<node><interface name="org.freedesktop.ScreenSaver">
+<method name="Lock"/>
+<method name="SimulateUserActivity"/>
+<method name="GetActive"><arg type="b" direction="out"/></method>
+<method name="GetActiveTime"><arg type="u" direction="out"/></method>
+<method name="GetSessionIdleTime"><arg type="u" direction="out"/></method>
+<method name="SetActive"><arg type="b" direction="in"/><arg type="b" direction="out"/></method>
+<method name="Inhibit"><arg type="s" direction="in"/><arg type="s" direction="in"/><arg type="u" direction="out"/></method>
+<method name="UnInhibit"><arg type="u" direction="in"/></method>
+<method name="Throttle"><arg type="s" direction="in"/><arg type="s" direction="in"/><arg type="u" direction="out"/></method>
+<method name="UnThrottle"><arg type="u" direction="in"/></method>
+<signal name="ActiveChanged"><arg type="b"/></signal>
+</interface></node>"""
+
+
+class Daemon:
+    def __init__(self):
+        self.cfg = load_config()
+        self._hacks = None
+        self.loop = GLib.MainLoop()
+        self.conn = None
+        self.backend = None
+        self.saver = None
+        self.pending_idle = False
+        self.inhibits = {}       # cookie -> (sender, app, reason, watch id)
+        self.next_cookie = 1
+        self.lock_src = None
+        self.recheck_src = None
+
+    def hacks(self):
+        if self._hacks is None:
+            self._hacks = load_hacks()
+            log("%d képernyőkímélő található" % len(self._hacks))
+        return self._hacks
+
+    # -- indulás
+    def run(self):
+        ensure_display()
+        Gio.bus_own_name(Gio.BusType.SESSION, BUS_NAME, Gio.BusNameOwnerFlags.DO_NOT_QUEUE,
+                         self._on_bus, self._on_acquired, self._on_lost)
+        for s in (signal.SIGTERM, signal.SIGINT):
+            unix_signal_add(s, self._on_term)
+        self.loop.run()
+
+    def _on_lost(self, conn, name):
+        log("A wxscreensaver daemon már fut (vagy nincs session bus).")
+        self.loop.quit()
+
+    def _on_term(self, *a):
+        self.quit()
+        return False
+
+    def _on_bus(self, conn, name):
+        self.conn = conn
+        ctl = Gio.DBusNodeInfo.new_for_xml(CTL_XML).interfaces[0]
+        conn.register_object(CTL_PATH, ctl, self._on_ctl_call, None, None)
+        fdo = Gio.DBusNodeInfo.new_for_xml(FDO_XML).interfaces[0]
+        for p in FDO_PATHS:
+            conn.register_object(p, fdo, self._on_fdo_call, None, None)
+        Gio.bus_own_name_on_connection(
+            conn, FDO_NAME, Gio.BusNameOwnerFlags.DO_NOT_QUEUE, None,
+            lambda c, n: log("%s foglalt (GNOME-on a gnome-shell birtokolja) – "
+                             "az inhibitet ilyenkor az org.gnome.SessionManager-en át kérdezem le" % FDO_NAME))
+
+    def _on_acquired(self, conn, name):
+        self.start_backend()
+        log("Daemon elindult (backend: %s)" % (self.backend.name if self.backend else "nincs"))
+
+    def start_backend(self):
+        if self.backend:
+            self.backend.stop()
+            self.backend = None
+        want = self.cfg.get("backend", "auto")
+        cls = None
+        if want == "mutter" or (want == "auto" and MutterBackend.available()):
+            cls = MutterBackend
+        elif want in ("swayidle", "auto") and SwayidleBackend.available():
+            cls = SwayidleBackend
+        if cls is None:
+            log("Nincs tétlenség-érzékelő backend. Telepítsd a swayidle csomagot!")
+            return
+        b = cls()
+        try:
+            b.start(max(60, int(float(self.cfg["timeout"]) * 60)), self.on_idle, self.on_resume)
+        except Exception as e:
+            log("Backend indítása sikertelen:", e)
+            return
+        self.backend = b
+
+    # -- esemény-kezelés
+    def _inhibited(self):
+        """Van aktív inhibit (saját D-Bus, vagy GNOME-on az org.gnome.SessionManager "idle" jelzője)?"""
+        if self.inhibits:
+            return True
+        try:
+            r = self.conn.call_sync(
+                "org.gnome.SessionManager", "/org/gnome/SessionManager",
+                "org.gnome.SessionManager", "IsInhibited", GLib.Variant("(u)", (8,)),
+                GLib.VariantType("(b)"), Gio.DBusCallFlags.NO_AUTO_START, 500, None)
+            return bool(r.unpack()[0])
+        except Exception:
+            return False
+
+    def on_idle(self):
+        if self.saver or self.cfg["mode"] == "off":
+            return
+        if self._inhibited():
+            log("Tétlenség, de van inhibit – kivárok")
+            self.pending_idle = True
+            if self.backend:
+                self.backend.watch_resume()     # ha közben megmozdul a felhasználó, ne induljon el
+            if not self.recheck_src:
+                self.recheck_src = GLib.timeout_add_seconds(15, self._recheck)
+            return
+        self.activate()
+
+    def _recheck(self):
+        if not self.pending_idle or self.saver:
+            self.recheck_src = None
+            return False
+        if self._inhibited():
+            return True
+        self.recheck_src = None
+        self.activate()
+        return False
+
+    def on_resume(self):
+        self.pending_idle = False
+        if self.saver:
+            self.deactivate()
+        elif self.backend:
+            self.backend.cancel_resume()
+
+    def activate(self):
+        if self.saver:
+            return
+        self.pending_idle = False
+        saver = Saver(self)
+        if not saver.start():
+            saver.stop()
+            return
+        self.saver = saver
+        if self.backend:
+            self.backend.watch_resume()
+        if self.cfg["lock"]:
+            after = max(0, int(self.cfg["lock_after"])) * 60
+            self.lock_src = GLib.timeout_add_seconds(max(1, after), self._lock_timer)
+        self._emit_active(True)
+
+    def deactivate(self):
+        if not self.saver:
+            return False
+        self.saver.stop()
+        self.saver = None
+        if self.lock_src:
+            GLib.source_remove(self.lock_src)
+            self.lock_src = None
+        if self.backend:
+            self.backend.cancel_resume()
+        self._emit_active(False)
+        return False
+
+    def _lock_timer(self):
+        self.lock_src = None
+        self.run_lock()
+        return False
+
+    def run_lock(self):
+        cmd = (self.cfg.get("lock_command") or "").strip()
+        if not cmd:
+            return
+        try:
+            subprocess.Popen(shlex.split(cmd), start_new_session=True)
+        except Exception as e:
+            log("Zároló parancs hiba:", e)
+
+    def _emit_active(self, on):
+        if not self.conn:
+            return
+        for p in FDO_PATHS:
+            try:
+                self.conn.emit_signal(None, p, FDO_NAME, "ActiveChanged", GLib.Variant("(b)", (on,)))
+            except Exception:
+                pass
+
+    def reload(self):
+        self.cfg = load_config()
+        self._hacks = None
+        gl_auto_level(reload=True)
+        self.start_backend()
+
+    def quit(self):
+        self.deactivate()
+        if self.backend:
+            self.backend.stop()
+        self.loop.quit()
+
+    def status(self):
+        return "%s; backend=%s; timeout=%smin; inhibitors=%d; mode=%s" % (
+            "active" if self.saver else "idle",
+            self.backend.name if self.backend else "none",
+            self.cfg["timeout"], len(self.inhibits), self.cfg["mode"])
+
+    # -- D-Bus: vezérlés
+    def _on_ctl_call(self, conn, sender, path, iface, method, params, inv):
+        try:
+            if method == "Activate":
+                self.activate()
+            elif method == "Deactivate":
+                self.deactivate()
+            elif method == "Lock":
+                self.run_lock()
+            elif method == "Reload":
+                self.reload()
+            elif method == "Quit":
+                inv.return_value(None)
+                GLib.idle_add(self.quit)
+                return
+            elif method == "Status":
+                inv.return_value(GLib.Variant("(s)", (self.status(),)))
+                return
+            inv.return_value(None)
+        except Exception as e:
+            inv.return_dbus_error("org.wxscreensaver.Error", str(e))
+
+    # -- D-Bus: org.freedesktop.ScreenSaver
+    def _on_fdo_call(self, conn, sender, path, iface, method, params, inv):
+        try:
+            if method in ("Inhibit", "Throttle"):
+                app, reason = params.unpack()
+                cookie = self._inhibit(sender, app, reason) if method == "Inhibit" else 0
+                inv.return_value(GLib.Variant("(u)", (cookie,)))
+            elif method == "UnInhibit":
+                self._uninhibit(params.unpack()[0])
+                inv.return_value(None)
+            elif method == "GetActive":
+                inv.return_value(GLib.Variant("(b)", (self.saver is not None,)))
+            elif method in ("GetActiveTime", "GetSessionIdleTime"):
+                inv.return_value(GLib.Variant("(u)", (0,)))
+            elif method == "SetActive":
+                on = params.unpack()[0]
+                GLib.idle_add(self.activate if on else self.deactivate)
+                inv.return_value(GLib.Variant("(b)", (True,)))
+            elif method == "Lock":
+                self.run_lock()
+                inv.return_value(None)
+            elif method == "SimulateUserActivity":
+                self.on_resume()
+                inv.return_value(None)
+            else:
+                inv.return_value(None)
+        except Exception as e:
+            inv.return_dbus_error("org.freedesktop.DBus.Error.Failed", str(e))
+
+    def _inhibit(self, sender, app, reason):
+        cookie = self.next_cookie
+        self.next_cookie += 1
+        wid = Gio.bus_watch_name_on_connection(
+            self.conn, sender, Gio.BusNameWatcherFlags.NONE, None,
+            lambda c, n: self._sender_gone(n))
+        self.inhibits[cookie] = (sender, app, reason, wid)
+        log("Inhibit: %s (%s)" % (app, reason))
+        return cookie
+
+    def _uninhibit(self, cookie):
+        item = self.inhibits.pop(cookie, None)
+        if not item:
+            return
+        GLib.idle_add(lambda: (Gio.bus_unwatch_name(item[3]), False)[1])
+        if not self.inhibits and self.pending_idle:
+            self.pending_idle = False
+            self.activate()
+
+    def _sender_gone(self, sender):
+        for cookie in [c for c, v in self.inhibits.items() if v[0] == sender]:
+            self._uninhibit(cookie)
+
+
+# --------------------------------------------------------------------------
+# Vezérlő kliens
+# --------------------------------------------------------------------------
+def ctl(method):
+    try:
+        conn = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        r = conn.call_sync(BUS_NAME, CTL_PATH, CTL_IFACE, method, None, None,
+                           Gio.DBusCallFlags.NONE, 1500, None)
+        u = r.unpack() if r is not None else ()
+        return True, (u[0] if u else "")
+    except GLib.Error as e:
+        return False, e.message
+
+
+def spawn_daemon():
+    try:
+        subprocess.Popen([self_exe(), "--daemon"], start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        log("Daemon indítása sikertelen:", e)
+
+
+# --------------------------------------------------------------------------
+# Beállító GUI
+# --------------------------------------------------------------------------
+class SettingsWindow:
+    MODES = [("off", "Disabled"), ("blank", "Blank screen only"),
+             ("random", "Random screensaver"), ("one", "Only one screensaver")]
+
+    def __init__(self):
+        self.cfg = load_config()
+        self.hacks = load_hacks()
+        self.current = None
+        self.save_src = None
+        self.prev_src = None
+        self.prev_running = False
+        self.prev_level = "native"
+        self.prev = HackProc(self._prev_exit)
+
+        install_css()
+        win = Gtk.Window(title="wxscreensaver")
+        apply_gl_visual(win)   # az előnézetben a GL hackek is működjenek
+        win.set_default_size(1050, 680)
+        win.connect("destroy", self._quit)
+        self.win = win
+
+        header = Gtk.HeaderBar()
+        header.set_show_close_button(True)
+        stack = Gtk.Stack()
+        stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
+        sw = Gtk.StackSwitcher()
+        sw.set_stack(stack)
+        header.set_custom_title(sw)
+        test = Gtk.Button(label=tr("Test"))
+        test.get_style_context().add_class("suggested-action")
+        test.connect("clicked", self._on_test)
+        header.pack_start(test)
+        win.set_titlebar(header)
+
+        stack.add_titled(self._build_hacks_page(), "hacks", tr("Screensavers"))
+        stack.add_titled(self._build_settings_page(), "settings", tr("Settings"))
+        stack.connect("notify::visible-child-name", lambda *a: self._refresh_status())
+        win.add(stack)
+        win.show_all()
+        self._update_mode_ui()
+
+        first = None
+        for row in self.listbox.get_children():
+            if row.hack.name == self.cfg.get("selected"):
+                first = row
+                break
+        first = first or (self.listbox.get_row_at_index(0))
+        if first:
+            self.listbox.select_row(first)
+
+    # ---- hack oldal
+    def _build_hacks_page(self):
+        paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+        paned.set_position(330)
+
+        left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        left.set_border_width(10)
+        mrow = Gtk.Box(spacing=8)
+        mrow.pack_start(Gtk.Label(label=tr("Mode:")), False, False, 0)
+        self.mode = Gtk.ComboBoxText()
+        for mid, text in self.MODES:
+            self.mode.append(mid, tr(text))
+        self.mode.set_active_id(self.cfg["mode"])
+        self.mode.connect("changed", self._on_mode)
+        mrow.pack_start(self.mode, True, True, 0)
+        left.pack_start(mrow, False, False, 0)
+
+        self.hint = Gtk.Label(label=tr("Select the screensaver from the list."), xalign=0)
+        self.hint.set_line_wrap(True)
+        self.hint.set_no_show_all(True)
+        left.pack_start(self.hint, False, False, 0)
+
+        self.search = Gtk.SearchEntry()
+        self.search.set_placeholder_text(tr("Search…"))
+        self.search.connect("search-changed", lambda *_: self.listbox.invalidate_filter())
+        left.pack_start(self.search, False, False, 0)
+
+        self.listbox = Gtk.ListBox()
+        self.listbox.set_filter_func(self._filter)
+        self.listbox.connect("row-selected", self._on_row)
+        for h in self.hacks.values():
+            row = Gtk.ListBoxRow()
+            row.hack = h
+            box = Gtk.Box(spacing=8)
+            box.set_border_width(4)
+            chk = Gtk.CheckButton()
+            chk.set_active(h.name not in self.cfg["disabled"])
+            chk.connect("toggled", self._on_check, h)
+            chk.set_no_show_all(True)
+            row.chk = chk
+            box.pack_start(chk, False, False, 0)
+            lab = Gtk.Label(label=h.label, xalign=0)
+            box.pack_start(lab, True, True, 0)
+            row.add(box)
+            self.listbox.add(row)
+        scroll = Gtk.ScrolledWindow()
+        scroll.add(self.listbox)
+        left.pack_start(scroll, True, True, 0)
+
+        brow = Gtk.Box(spacing=8)
+        b1 = Gtk.Button(label=tr("Check all"))
+        b2 = Gtk.Button(label=tr("Uncheck all"))
+        b1.connect("clicked", lambda *_: self._check_all(True))
+        b2.connect("clicked", lambda *_: self._check_all(False))
+        self.btn_all = (b1, b2)
+        brow.pack_start(b1, True, True, 0)
+        brow.pack_start(b2, True, True, 0)
+        left.pack_start(brow, False, False, 0)
+        paned.pack1(left, False, False)
+
+        right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        right.set_border_width(12)
+        self.preview = Gtk.DrawingArea()
+        self.preview.set_size_request(480, 270)
+        self.preview.connect("draw", self._prev_draw)
+        self.preview.connect("realize", self._prev_realize)
+        frame = Gtk.AspectFrame(xalign=0.5, yalign=0.5, ratio=16 / 9, obey_child=False)
+        frame.set_shadow_type(Gtk.ShadowType.NONE)
+        frame.add(self.preview)
+        # fekete háttér az előnézet mögött (különben átlátszhat az asztalra)
+        bg = Gtk.EventBox()
+        bg.get_style_context().add_class("wxss-black")
+        bg.add(frame)
+        right.pack_start(bg, True, True, 0)
+
+        self.title = Gtk.Label(xalign=0)
+        right.pack_start(self.title, False, False, 0)
+        self.desc = Gtk.Label(xalign=0, yalign=0)
+        self.desc.set_line_wrap(True)
+        self.desc.set_selectable(True)
+        right.pack_start(self.desc, False, False, 0)
+        self.prev_msg = Gtk.Label(xalign=0)
+        right.pack_start(self.prev_msg, False, False, 0)
+
+        ohead = Gtk.Box(spacing=8)
+        lab = Gtk.Label(xalign=0)
+        lab.set_markup("<b>%s</b>" % GLib.markup_escape_text(tr("Options")))
+        ohead.pack_start(lab, True, True, 0)
+        reset = Gtk.Button(label=tr("Reset to defaults"))
+        reset.connect("clicked", self._on_reset)
+        ohead.pack_end(reset, False, False, 0)
+        right.pack_start(ohead, False, False, 0)
+
+        self.opts_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        osw = Gtk.ScrolledWindow()
+        osw.set_min_content_height(150)
+        osw.add(self.opts_box)
+        right.pack_start(osw, True, True, 0)
+        paned.pack2(right, True, False)
+        return paned
+
+    def _filter(self, row):
+        q = self.search.get_text().strip().lower()
+        return not q or q in row.hack.label.lower() or q in row.hack.name
+
+    def _check_all(self, on):
+        for row in self.listbox.get_children():
+            row.chk.set_active(on)
+
+    def _on_check(self, chk, hack):
+        dis = set(self.cfg["disabled"])
+        if chk.get_active():
+            dis.discard(hack.name)
+        else:
+            dis.add(hack.name)
+        self.cfg["disabled"] = sorted(dis)
+        self._changed()
+
+    def _on_mode(self, combo):
+        self.cfg["mode"] = combo.get_active_id()
+        self._update_mode_ui()
+        self._changed()
+
+    def _update_mode_ui(self):
+        """Jelölőnégyzetek csak véletlen módban; "csak egy" módban a kijelölt sor számít."""
+        mode = self.cfg["mode"]
+        for row in self.listbox.get_children():
+            row.chk.set_visible(mode == "random")
+        for b in self.btn_all:
+            b.set_sensitive(mode == "random")
+        self.hint.set_visible(mode == "one")
+
+    def _on_row(self, lb, row):
+        if row is None:
+            return
+        h = row.hack
+        self.current = h
+        self.cfg["selected"] = h.name
+        self.title.set_markup("<span size='large' weight='bold'>%s</span>"
+                              % GLib.markup_escape_text(h.label))
+        self.desc.set_text(h.desc or tr("No description."))
+        self._rebuild_options(h)
+        self._schedule_preview()
+        self._changed()
+
+    def _on_reset(self, *_):
+        if self.current:
+            self.cfg["options"].pop(self.current.name, None)
+            self._rebuild_options(self.current)
+            self._schedule_preview()
+            self._changed()
+
+    # ---- hack-opciók
+    def _set_opt(self, hack, cid, v):
+        self.cfg["options"].setdefault(hack.name, {})[cid] = v
+        self._schedule_preview()
+        self._changed()
+
+    def _rebuild_options(self, hack):
+        for ch in self.opts_box.get_children():
+            self.opts_box.remove(ch)
+        vals = self.cfg["options"].get(hack.name, {})
+        for c in hack.controls:
+            cur = vals.get(c["id"], c["default"])
+            t = c["type"]
+            if t == "number":
+                self.opts_box.pack_start(self._number_widget(hack, c, cur), False, False, 0)
+            elif t == "bool":
+                chk = Gtk.CheckButton(label=c["label"])
+                chk.set_active(bool(cur))
+                chk.connect("toggled", lambda w, h=hack, c=c: self._set_opt(h, c["id"], w.get_active()))
+                self.opts_box.pack_start(chk, False, False, 0)
+            elif t == "select":
+                box = Gtk.Box(spacing=8)
+                if c["label"]:
+                    box.pack_start(Gtk.Label(label=c["label"], xalign=0), False, False, 0)
+                cb = Gtk.ComboBoxText()
+                for o in c["options"]:
+                    cb.append(o["id"], o["label"])
+                cb.set_active_id(cur)
+                cb.connect("changed", lambda w, h=hack, c=c: self._set_opt(h, c["id"], w.get_active_id()))
+                box.pack_start(cb, True, True, 0)
+                self.opts_box.pack_start(box, False, False, 0)
+            elif t == "string":
+                box = Gtk.Box(spacing=8)
+                box.pack_start(Gtk.Label(label=c["label"], xalign=0), False, False, 0)
+                en = Gtk.Entry()
+                en.set_text(str(cur or ""))
+                en.connect("changed", lambda w, h=hack, c=c: self._set_opt(h, c["id"], w.get_text()))
+                box.pack_start(en, True, True, 0)
+                self.opts_box.pack_start(box, False, False, 0)
+        self.opts_box.show_all()
+
+    def _number_widget(self, hack, c, cur):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        box.pack_start(Gtk.Label(label=c["label"], xalign=0), False, False, 0)
+        low, high = c["low"], c["high"]
+        step = max(1.0, round((high - low) / 200.0)) if c["int"] else (high - low) / 200.0
+        pos = (low + high - float(cur)) if c["invert"] else float(cur)
+
+        def to_value(p):
+            v = (low + high - p) if c["invert"] else p
+            return int(round(v)) if c["int"] else v
+
+        if c["widget"] == "spinbutton":
+            w = Gtk.SpinButton.new_with_range(low, high, step)
+            w.set_value(pos)
+            w.connect("value-changed", lambda s: self._set_opt(hack, c["id"], to_value(s.get_value())))
+            box.pack_start(w, False, False, 0)
+            return box
+        w = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, low, high, step)
+        w.set_draw_value(False)
+        w.set_digits(0 if c["int"] else 3)
+        w.set_value(pos)
+        w.connect("value-changed", lambda s: self._set_opt(hack, c["id"], to_value(s.get_value())))
+        box.pack_start(w, False, False, 0)
+        if c["low_label"] or c["high_label"]:
+            lr = Gtk.Box()
+            lr.pack_start(Gtk.Label(label=c["low_label"], xalign=0), True, True, 0)
+            lr.pack_end(Gtk.Label(label=c["high_label"], xalign=1), True, True, 0)
+            box.pack_start(lr, False, False, 0)
+        return box
+
+    # ---- előnézet
+    def _prev_realize(self, area):
+        try:
+            gw = area.get_window()
+            gw.ensure_native()
+            gw.set_background_rgba(Gdk.RGBA(0, 0, 0, 1))
+        except Exception:
+            pass
+
+    def _prev_draw(self, w, cr):
+        if not self.prev_running:
+            cr.set_source_rgb(0, 0, 0)
+            cr.paint()
+        return True
+
+    def _schedule_preview(self):
+        if self.prev_src:
+            GLib.source_remove(self.prev_src)
+        self.prev_running = False
+        self.prev.stop()
+        self.preview.queue_draw()
+        self.prev_src = GLib.timeout_add(350, self._start_preview)
+
+    def _start_preview(self):
+        self.prev_src = None
+        h = self.current
+        gw = self.preview.get_window()
+        if not h or gw is None:
+            return False
+        self.prev_msg.set_text("")
+        xid = GdkX11.X11Window.get_xid(gw)
+        argv = h.argv(self.cfg["options"].get(h.name, {}), xid)
+        self.prev_level = gl_level(self.cfg)
+        self.prev_running = self.prev.start(argv, gl_env(self.prev_level))
+        if not self.prev_running:
+            self.prev_msg.set_text(tr("Preview could not be started."))
+        return False
+
+    def _prev_exit(self, runtime):
+        self.prev_running = False
+        self.preview.queue_draw()
+        if runtime < 3:
+            h = self.current
+            if h and gl_failed(h.name) and gl_escalate(self.cfg, self.prev_level):
+                GLib.timeout_add(200, self._start_preview)   # újra, másik GL-driverrel
+                return
+            self.prev_msg.set_text(tr("Preview could not be started."))
+
+    # ---- általános beállítások oldal
+    def _build_settings_page(self):
+        grid = Gtk.Grid(column_spacing=16, row_spacing=14)
+        grid.set_border_width(24)
+        grid.set_halign(Gtk.Align.CENTER)
+        r = [0]
+
+        def row(label, widget):
+            grid.attach(Gtk.Label(label=label, xalign=1), 0, r[0], 1, 1)
+            widget.set_halign(Gtk.Align.START)
+            grid.attach(widget, 1, r[0], 1, 1)
+            r[0] += 1
+
+        def spin(key, lo, hi):
+            s = Gtk.SpinButton.new_with_range(lo, hi, 1)
+            s.set_value(float(self.cfg[key]))
+            s.connect("value-changed", lambda w: self._set_cfg(key, int(w.get_value())))
+            return s
+
+        row(tr("Start after (minutes of inactivity)"), spin("timeout", 1, 720))
+        row(tr("Switch screensaver every (minutes)"), spin("cycle", 1, 720))
+
+        sw = Gtk.Switch()
+        sw.set_active(bool(self.cfg["lock"]))
+        sw.connect("notify::active", lambda w, _: self._set_cfg("lock", w.get_active()))
+        row(tr("Lock the screen"), sw)
+        row(tr("Lock after (minutes, 0 = immediately)"), spin("lock_after", 0, 720))
+
+        en = Gtk.Entry()
+        en.set_width_chars(34)
+        en.set_text(self.cfg["lock_command"])
+        en.connect("changed", lambda w: self._set_cfg("lock_command", w.get_text()))
+        row(tr("Lock command"), en)
+
+        note = Gtk.Label(label=tr("Locking note"), xalign=0)
+        note.set_line_wrap(True)
+        note.set_max_width_chars(60)
+        note.get_style_context().add_class("dim-label")
+        grid.attach(note, 1, r[0], 1, 1)
+        r[0] += 1
+
+        be = Gtk.ComboBoxText()
+        be.append("auto", tr("Automatic"))
+        be.append("swayidle", "swayidle (ext-idle-notify)")
+        be.append("mutter", "GNOME / Mutter")
+        be.set_active_id(self.cfg.get("backend", "auto"))
+        be.connect("changed", lambda w: self._set_cfg("backend", w.get_active_id()))
+        row(tr("Idle detection"), be)
+
+        gl = Gtk.ComboBoxText()
+        gl.append("auto", tr("Automatic"))
+        gl.append("native", tr("System driver (e.g. NVIDIA)"))
+        gl.append("zink", tr("Mesa Zink (GPU through Vulkan)"))
+        gl.append("mesa", tr("Mesa software rendering"))
+        gl.set_active_id(self.cfg.get("gl_driver", "auto"))
+        gl.connect("changed", self._on_gl_driver)
+        row(tr("OpenGL driver"), gl)
+
+        auto = Gtk.Switch()
+        auto.set_active(is_autostart())
+        auto.connect("notify::active", lambda w, _: set_autostart(w.get_active()))
+        row(tr("Start at login"), auto)
+
+        drow = Gtk.Box(spacing=10)
+        self.status = Gtk.Label(xalign=0)
+        drow.pack_start(self.status, False, False, 0)
+        rb = Gtk.Button(label=tr("Restart daemon"))
+        rb.connect("clicked", self._on_restart)
+        drow.pack_start(rb, False, False, 0)
+        row(tr("Daemon"), drow)
+        self._refresh_status()
+
+        sc = Gtk.ScrolledWindow()
+        sc.add(grid)
+        return sc
+
+    def _on_gl_driver(self, combo):
+        self.cfg["gl_driver"] = combo.get_active_id()
+        if self.cfg["gl_driver"] == "auto":
+            gl_set_auto_level("native")      # újrakezdi a próbálkozást a rendszer-drivertől
+        self._changed()
+        self._schedule_preview()
+
+    def _set_cfg(self, key, v):
+        self.cfg[key] = v
+        self._changed()
+
+    def _refresh_status(self):
+        ok, text = ctl("Status")
+        self.status.set_text("%s (%s)" % (tr("running"), text) if ok else tr("not running"))
+
+    def _on_restart(self, *_):
+        ctl("Quit")
+        GLib.timeout_add(700, lambda: (spawn_daemon(), GLib.timeout_add(1200, self._refresh_status), False)[2])
+
+    def _on_test(self, *_):
+        self._save_now()
+        ok, _ = ctl("Activate")
+        if not ok:
+            spawn_daemon()
+            GLib.timeout_add(1500, lambda: (ctl("Activate"), False)[1])
+
+    # ---- mentés
+    def _changed(self):
+        if self.save_src:
+            GLib.source_remove(self.save_src)
+        self.save_src = GLib.timeout_add(600, self._save_now)
+
+    def _save_now(self):
+        self.save_src = None
+        try:
+            save_config(self.cfg)
+        except OSError as e:
+            log("Mentés sikertelen:", e)
+        ctl("Reload")
+        return False
+
+    def _quit(self, *_):
+        if self.save_src:
+            GLib.source_remove(self.save_src)
+            self._save_now()
+        self.prev.stop()
+        Gtk.main_quit()
+
+
+def run_settings():
+    if not ensure_gtk():
+        print("Nem indítható a GUI: nincs elérhető X kijelző (Xwayland). "
+              "Ellenőrizd, hogy az Xwayland engedélyezve van-e.", file=sys.stderr)
+        return 1
+    SettingsWindow()
+    Gtk.main()
+    return 0
+
+
+# --------------------------------------------------------------------------
+def main():
+    p = argparse.ArgumentParser(prog="wxscreensaver",
+                                description="Wayland-kompatibilis xscreensaver-pótlás")
+    g = p.add_mutually_exclusive_group()
+    for flag, hlp in (("daemon", "háttérszolgáltatás indítása"),
+                      ("settings", "beállító ablak (alapértelmezett)"),
+                      ("activate", "képernyőkímélő azonnali indítása"),
+                      ("deactivate", "képernyőkímélő leállítása"),
+                      ("lock", "zároló parancs futtatása"),
+                      ("reload", "beállítások újratöltése"),
+                      ("status", "állapot kiírása"),
+                      ("quit", "daemon leállítása")):
+        g.add_argument("--" + flag, action="store_true", help=hlp)
+    p.add_argument("--version", action="version", version="wxscreensaver " + VERSION)
+    a = p.parse_args()
+
+    if a.daemon:
+        Daemon().run()
+        return 0
+    for flag, method in (("activate", "Activate"), ("deactivate", "Deactivate"), ("lock", "Lock"),
+                         ("reload", "Reload"), ("status", "Status"), ("quit", "Quit")):
+        if getattr(a, flag):
+            ok, text = ctl(method)
+            if not ok:
+                print("A daemon nem fut (%s)" % text, file=sys.stderr)
+                return 1
+            if text:
+                print(text)
+            return 0
+    return run_settings()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
