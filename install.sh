@@ -42,7 +42,14 @@ Hidden=true
 EOF
 
 echo "==> Daemon indítása"
-setsid -f /usr/local/bin/wxscreensaver --daemon >/dev/null 2>&1 || true
+if [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ] && { [ -n "${WAYLAND_DISPLAY:-}" ] || [ -n "${DISPLAY:-}" ]; }; then
+    setsid -f /usr/local/bin/wxscreensaver --daemon >/dev/null 2>&1 || true
+    sleep 1
+    /usr/local/bin/wxscreensaver --status \
+        || echo "A daemon nem indult el; próbáld: WXSS_DEBUG=1 wxscreensaver --daemon"
+else
+    echo "Nincs grafikus session (D-Bus/DISPLAY/WAYLAND_DISPLAY hiányzik) – a daemon a következő bejelentkezéskor indul."
+fi
 
 echo
 echo "Kész. Beállítások: wxscreensaver"

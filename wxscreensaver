@@ -173,6 +173,31 @@ def load_config():
             cfg.update(data)
     except (OSError, ValueError):
         pass
+    return sanitize_config(cfg)
+
+
+def sanitize_config(cfg):
+    """Hibás / elavult értékek a config.json-ban -> alapértelmezés (a GUI és a daemon ne akadjon el)."""
+    choices = {"mode": ("off", "blank", "random", "one"),
+               "backend": ("auto", "swayidle", "mutter"),
+               "gl_driver": ("auto", "native", "zink", "mesa")}
+    for k, ok in choices.items():
+        if cfg.get(k) not in ok:
+            cfg[k] = DEFAULTS[k]
+    for k, lo in (("timeout", 1), ("cycle", 1), ("lock_after", 0)):
+        try:
+            cfg[k] = max(lo, int(float(cfg[k])))
+        except (TypeError, ValueError, KeyError):
+            cfg[k] = DEFAULTS[k]
+    for k in ("selected", "lock_command"):
+        if not isinstance(cfg.get(k), str):
+            cfg[k] = DEFAULTS[k]
+    if not isinstance(cfg.get("disabled"), list):
+        cfg["disabled"] = []
+    opts = cfg.get("options")
+    cfg["options"] = ({k: v for k, v in opts.items() if isinstance(v, dict)}
+                      if isinstance(opts, dict) else {})
+    cfg["lock"] = bool(cfg.get("lock"))
     return cfg
 
 
@@ -444,9 +469,14 @@ def gl_visual_id():
                                  timeout=10).stdout
         except Exception:
             continue
-        m = re.search(r"\b(0x[0-9a-fA-F]+|\d+)\b", out)
+        # a kimenet csak az azonosító legyen (külön sorban); ha nem, az első 0x… alakú szám
+        m = (re.search(r"^\s*(0x[0-9a-fA-F]+|[1-9]\d*)\s*$", out, re.M)
+             or re.search(r"\b(0x[0-9a-fA-F]+)\b", out))
         if m:
-            vid = int(m.group(1), 0)
+            try:
+                vid = int(m.group(1), 0)
+            except ValueError:
+                continue
             break
     if vid is None:
         log("Nem találtam GL visualt (xscreensaver-gl-helper / glxinfo) – a GL hackek feketék lehetnek.")
@@ -542,7 +572,8 @@ def gl_failed(name):
 
 
 def gl_escalate(cfg, seen_level):
-    """Egy szinttel feljebb lép (csak "auto" módban). Az új szintet adja vissza, vagy None-t."""
+    """Átlép a tartalék-lista következő elemére (csak "auto" módban); az új szintet adja
+    vissza, vagy None-t, ha nincs több tartalék."""
     if cfg.get("gl_driver", "auto") != "auto":
         return None
     cur = gl_auto_level()
@@ -1100,8 +1131,14 @@ class Daemon:
         self.activate()
         return False
 
+    def _cancel_recheck(self):
+        if self.recheck_src:
+            GLib.source_remove(self.recheck_src)
+            self.recheck_src = None
+
     def on_resume(self):
         self.pending_idle = False
+        self._cancel_recheck()
         if self.saver:
             self.deactivate()
         elif self.backend:
@@ -1166,6 +1203,7 @@ class Daemon:
         self.start_backend()
 
     def quit(self):
+        self._cancel_recheck()
         self.deactivate()
         if self.backend:
             self.backend.stop()
@@ -1506,7 +1544,7 @@ class SettingsWindow:
                 cb = Gtk.ComboBoxText()
                 for o in c["options"]:
                     cb.append(o["id"], o["label"])
-                cb.set_active_id(cur)
+                cb.set_active_id(cur if cur in [o["id"] for o in c["options"]] else c["default"])
                 cb.connect("changed", lambda w, h=hack, c=c: self._set_opt(h, c["id"], w.get_active_id()))
                 box.pack_start(cb, True, True, 0)
                 self.opts_box.pack_start(box, False, False, 0)
