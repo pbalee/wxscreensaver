@@ -7,6 +7,8 @@ az eredeti `xscreensaver` daemon **nem** indul el.
 ## Telepítés (Arch Linux)
 
 ```bash
+git clone https://github.com/pbalee/wxscreensaver
+cd wxscreensaver
 chmod +x install.sh wxscreensaver
 ./install.sh
 ```
