@@ -1788,11 +1788,158 @@ def run_settings():
 
 
 # --------------------------------------------------------------------------
+def run_diagnose(hack_name="glmatrix"):
+    """Rendszerinfó + a GL hack kipróbálása minden driver-szinten (native / zink / mesa).
+
+    A jelentés a képernyőre és a ~/.cache/wxscreensaver/diagnose.txt fájlba is kerül."""
+    lines = []
+
+    def out(*a):
+        s = " ".join(str(x) for x in a)
+        print(s, flush=True)
+        lines.append(s)
+
+    def sh(cmd, n=14, grep=None):
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=25)
+            text = (r.stdout if r.stdout.strip() else r.stderr).strip().splitlines()
+        except FileNotFoundError:
+            return ["(nincs telepítve: %s)" % cmd[0]]
+        except Exception as e:
+            return ["(hiba: %s)" % e]
+        if grep:
+            text = [t for t in text if re.search(grep, t, re.I)]
+        return [t.rstrip() for t in text[:n]] or ["(üres kimenet)"]
+
+    def show(title, cmd, n=14, grep=None):
+        out("-- " + title)
+        for t in sh(cmd, n, grep):
+            out("   " + t)
+
+    def read(path):
+        try:
+            with open(path, "r") as f:
+                return f.read().strip()
+        except OSError:
+            return "(nem olvasható)"
+
+    out("wxscreensaver %s – GL-diagnosztika (hack: %s)" % (VERSION, hack_name))
+    out("\n== Környezet ==")
+    for k in ("XDG_SESSION_TYPE", "XDG_CURRENT_DESKTOP", "WAYLAND_DISPLAY", "DISPLAY"):
+        out("%s=%s" % (k, os.environ.get(k, "")))
+    ensure_display()
+    out("DISPLAY (használt)=%s" % os.environ.get("DISPLAY", ""))
+    cfg = load_config()
+    out("gl_driver (config)=%s, gl_level (megjegyzett)=%s" % (cfg["gl_driver"], gl_auto_level(reload=True)))
+
+    out("\n== Csomagok és driver ==")
+    show("telepített csomagok", ["pacman", "-Q", "xscreensaver", "nvidia", "nvidia-open", "nvidia-dkms",
+                                  "nvidia-open-dkms", "nvidia-utils", "egl-wayland", "mesa", "mesa-utils",
+                                  "xorg-xwayland", "vulkan-icd-loader", "gnome-shell", "mutter"], 20)
+    show("nvidia-smi", ["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv,noheader"], 4)
+    out("-- nvidia_drm modeset/fbdev: %s / %s" % (
+        read("/sys/module/nvidia_drm/parameters/modeset"), read("/sys/module/nvidia_drm/parameters/fbdev")))
+    try:
+        out("-- EGL vendor fájlok: %s" % ", ".join(sorted(os.listdir("/usr/share/glvnd/egl_vendor.d"))))
+    except OSError:
+        out("-- EGL vendor fájlok: (nincs /usr/share/glvnd/egl_vendor.d)")
+    show("glxinfo (Xwayland)", ["glxinfo", "-B"], 12, r"renderer|OpenGL version|direct rendering|vendor")
+    show("vulkaninfo", ["vulkaninfo", "--summary"], 12, r"deviceName|driverName|driverInfo")
+    out("-- GL visual: %s" % (hex(gl_visual_id()) if gl_visual_id() else "(nem található)"))
+    show("engedélyezett GNOME-kiterjesztések", ["gnome-extensions", "list", "--enabled"], 30)
+
+    out("\n== GL-próba (%s, szintenként 4 mp) ==" % hack_name)
+    results = []
+    if not ensure_gtk():
+        out("Nincs elérhető X kijelző (Xwayland) – a próba kimarad.")
+    else:
+        h = load_hacks().get(hack_name)
+        if h is None:
+            out("A '%s' hack nem található (telepítve van az xscreensaver?)." % hack_name)
+        else:
+            install_css()
+            levels = list(GL_LEVELS)
+            loop = GLib.MainLoop()
+
+            def next_level():
+                if not levels:
+                    loop.quit()
+                    return False
+                lvl = levels.pop(0)
+                win = Gtk.Window(title="wxscreensaver diagnose: %s" % lvl)
+                apply_gl_visual(win)
+                win.set_default_size(640, 360)
+                area = Gtk.DrawingArea()
+
+                def realize(a):
+                    gw = a.get_window()
+                    gw.ensure_native()
+                    gw.set_background_rgba(Gdk.RGBA(0, 0, 0, 1))
+                area.connect("realize", realize)
+                win.add(area)
+                win.show_all()
+                state = {"exited": None}
+                proc = HackProc(lambda rt: state.update(exited=rt))
+
+                def launch():
+                    gw = area.get_window()
+                    xid = GdkX11.X11Window.get_xid(gw) if gw else 0
+                    if xid:
+                        proc.start(h.argv({}, xid), gl_env(lvl))
+                    GLib.timeout_add(4000, finish)
+                    return False
+
+                def finish():
+                    alive = proc.proc is not None and state["exited"] is None
+                    proc.stop()
+                    tail = read(hack_log_path(os.path.basename(h.binary)))
+                    results.append((lvl, alive, tail))
+                    win.destroy()
+                    GLib.timeout_add(1800, next_level)
+                    return False
+
+                GLib.timeout_add(800, launch)
+                return False
+
+            GLib.idle_add(next_level)
+            loop.run()
+
+            first_ok = None
+            for lvl, ok, tail in results:
+                out("[%s] %s" % (lvl, "MŰKÖDIK (4 mp után is fut)" if ok else "HIBA (kilépett)"))
+                if not ok:
+                    for t in (tail.splitlines() or ["(üres napló)"])[:4]:
+                        out("      " + t)
+                if ok and first_ok is None:
+                    first_ok = lvl
+            out("")
+            if first_ok is None:
+                out("Egyik szint sem működött. Küldd el ezt a jelentést (diagnose.txt).")
+            elif cfg["gl_driver"] == "auto":
+                gl_set_auto_level(first_ok)
+                out("Beállítottam az automatikus módot erre a szintre: %s." % first_ok)
+                out("A futó daemon: wxscreensaver --reload")
+            else:
+                out("Működő szint: %s – válaszd ki a Beállítások → OpenGL driver listában." % first_ok)
+
+    try:
+        d = os.path.join(GLib.get_user_cache_dir(), "wxscreensaver")
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, "diagnose.txt")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        print("\nA jelentés mentve: %s" % path)
+    except OSError:
+        pass
+    return 0
+
+
 def main():
     p = argparse.ArgumentParser(prog="wxscreensaver",
                                 description="Wayland-kompatibilis xscreensaver-pótlás")
     g = p.add_mutually_exclusive_group()
     for flag, hlp in (("daemon", "háttérszolgáltatás indítása"),
+                      ("diagnose", "GL-diagnosztika: rendszerinfó + a hack kipróbálása minden driver-szinten"),
                       ("settings", "beállító ablak (alapértelmezett)"),
                       ("activate", "képernyőkímélő azonnali indítása"),
                       ("deactivate", "képernyőkímélő leállítása"),
@@ -1801,12 +1948,15 @@ def main():
                       ("status", "állapot kiírása"),
                       ("quit", "daemon leállítása")):
         g.add_argument("--" + flag, action="store_true", help=hlp)
+    p.add_argument("--hack", default="glmatrix", help="a --diagnose által kipróbált hack (alapból glmatrix)")
     p.add_argument("--version", action="version", version="wxscreensaver " + VERSION)
     a = p.parse_args()
 
     if a.daemon:
         Daemon().run()
         return 0
+    if a.diagnose:
+        return run_diagnose(a.hack)
     for flag, method in (("activate", "Activate"), ("deactivate", "Deactivate"), ("lock", "Lock"),
                          ("reload", "Reload"), ("status", "Status"), ("quit", "Quit")):
         if getattr(a, flag):

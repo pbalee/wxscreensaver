@@ -73,6 +73,7 @@ Frissítés: `git pull`, majd `./uninstall.sh --keep-config` és `./install.sh`.
 | `wxscreensaver --activate` / `--deactivate` | indítás / leállítás kézzel |
 | `wxscreensaver --lock` | zároló parancs futtatása |
 | `wxscreensaver --status` / `--reload` / `--quit` | állapot / újratöltés / leállítás |
+| `wxscreensaver --diagnose` | GL-diagnosztika: rendszerinfó, és a GLMatrix kipróbálása minden driver-szinten (`--hack NÉV` másik hackhez); a jelentés a `~/.cache/wxscreensaver/diagnose.txt` fájlba is kerül |
 
 Beállítások: `~/.config/wxscreensaver/config.json` (a GUI menti).
 
@@ -102,6 +103,10 @@ Xwayland) hibával leáll (`eglCreatePlatformWindowSurface failed`). Ezért a pr
 
 Az éppen működő szintet megjegyzi (`~/.cache/wxscreensaver/gl_level`). A *Beállítások →
 OpenGL driver* listában kézzel is választhatsz.
+
+Driver-frissítés vagy újratelepítés után futtasd a `wxscreensaver --diagnose` parancsot: kipróbálja
+a GLMatrixot mindhárom szinten, és az automatikus módot az első működőre állítja. (Az automatikus
+mód magától csak „lefelé” lép, a jobb szintre nem tér vissza.)
 
 ## Korlátok
 
