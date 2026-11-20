@@ -14,7 +14,8 @@ license=('MIT')
 depends=('python' 'python-gobject' 'gtk3' 'xscreensaver' 'xorg-xwayland')
 optdepends=('swayidle: idle detection outside GNOME (sway, Hyprland, labwc, KDE, ...)'
             'mesa-utils: glxinfo, used to find the GL visual if xscreensaver-gl-visual is missing'
-            'vulkan-driver: GPU-accelerated Zink fallback for GL hacks')
+            'vulkan-driver: GPU-accelerated Zink fallback for GL hacks'
+            'vulkan-tools: vulkaninfo, shown in the --diagnose report')
 install=wxscreensaver.install
 source=('wxscreensaver' 'LICENSE' 'README.md')
 sha256sums=('SKIP' 'SKIP' 'SKIP')   # helyi fájlok, nincs letöltés

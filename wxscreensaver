@@ -41,6 +41,7 @@ from gi.repository import GLib, Gio
 
 try:  # az elavult GLib/Gdk hívásokról szóló figyelmeztetések elnyomása
     import warnings
+    warnings.simplefilter("ignore", DeprecationWarning)
     warnings.simplefilter("ignore", gi.PyGIDeprecationWarning)
 except Exception:
     pass
